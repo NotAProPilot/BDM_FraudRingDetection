@@ -3,3 +3,5 @@ Code filter=lfs diff=lfs merge=lfs -text
 Data/*.csv filter=lfs diff=lfs merge=lfs -text
 Data/*.parquet filter=lfs diff=lfs merge=lfs -text
 Code/ filter=lfs diff=lfs merge=lfs -text
+Data/train_transaction.csv filter=lfs diff=lfs merge=lfs -text
+. filter=lfs diff=lfs merge=lfs -text
