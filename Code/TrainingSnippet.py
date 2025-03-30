@@ -12,26 +12,6 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from tqdm import tqdm
 import logging
 
-import sentry_sdk
-
-sentry_sdk.init(
-    dsn="https://406b896e74d3672165da6d45959fb550@o4509066679681024.ingest.de.sentry.io/4509066681647184",
-    max_breadcrumbs=50,
-    debug=True,
-    # Set traces_sample_rate to 1.0 to capture 100%
-    # of transactions for tracing.
-    traces_sample_rate=1.0,
-    # Add request headers and IP for users,
-    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
-    send_default_pii=True,
-
-    # By default the SDK will try to use the SENTRY_RELEASE
-    # environment variable, or infer a git commit
-    # SHA as release, however you may want to set
-    # something more human-readable.
-    # release="myapp@1.0.0",
-)
-
 # Initialize logging
 logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
