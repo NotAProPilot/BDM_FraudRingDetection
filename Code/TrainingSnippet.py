@@ -1,23 +1,3 @@
-"""
-Fraud Detection Pipeline using Graph Analysis and Machine Learning
-
-This script performs the following tasks:
-1. Loads transaction data from Parquet (or converts CSV to Parquet for efficiency).
-2. Constructs a transaction graph using NetworkX, connecting transactions based on shared attributes.
-3. Applies the Louvain method for community detection to identify fraud rings.
-4. Visualizes fraud rings using Plotly.
-5. Generates node embeddings via Node2Vec for machine learning input.
-6. Trains a RandomForest model to classify fraudulent transactions.
-7. Saves the trained model for future predictions.
-
-Optimizations:
-- Efficient graph construction using `itertuples()` instead of `iterrows()`.
-- Fraud-based edge weight reinforcement for improved detection.
-- Detailed logging for debugging and monitoring.
-- Memory-efficient data handling (dropping NaNs early).
-- Joblib-based model persistence.
-
-"""
 import os
 import pandas as pd
 import networkx as nx
@@ -28,48 +8,86 @@ from node2vec import Node2Vec
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from tqdm import tqdm
 import logging
 
-# Initialize logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn="https://406b896e74d3672165da6d45959fb550@o4509066679681024.ingest.de.sentry.io/4509066681647184",
+    max_breadcrumbs=50,
+    debug=True,
+    # Set traces_sample_rate to 1.0 to capture 100%
+    # of transactions for tracing.
+    traces_sample_rate=1.0,
+    # Add request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+
+    # By default the SDK will try to use the SENTRY_RELEASE
+    # environment variable, or infer a git commit
+    # SHA as release, however you may want to set
+    # something more human-readable.
+    # release="myapp@1.0.0",
 )
 
-# Define dataset paths
-DATA_PATH = r"D:\FIT\Senior Year\SPRING 2025\BDM\Grand Project\CodeAndData\Data"
-TRANSACTION_PARQUET = os.path.join(DATA_PATH, "train_transaction.parquet")
-IDENTITY_PARQUET = os.path.join(DATA_PATH, "train_identity.parquet")
+# Initialize logging
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Define dataset file paths
+TRANSACTION_FILE = r"D:\FIT\Senior Year\SPRING 2025\BDM\Grand Project\CodeAndData\Data\train_transaction.parquet"
+IDENTITY_FILE = r"D:\FIT\Senior Year\SPRING 2025\BDM\Grand Project\CodeAndData\Data\train_identity.parquet"
 MODEL_PATH = "fraud_detection_model.pkl"
 
-def load_data() -> pd.DataFrame:
-    """Loads transaction datasets from Parquet, or converts CSV to Parquet first.
 
-    If Parquet files exist, they are used. Otherwise, CSV files are converted.
+def load_and_preprocess_data() -> pd.DataFrame:
+    """Loads and preprocesses transaction datasets.
 
     Returns:
-        pd.DataFrame: Merged transaction dataset.
+        pd.DataFrame: Cleaned and feature-engineered dataset.
     """
-    if os.path.exists(TRANSACTION_PARQUET) and os.path.exists(IDENTITY_PARQUET):
-        logging.info("Loading data from Parquet files...")
-        transactions = pd.read_parquet(TRANSACTION_PARQUET)
-        identity = pd.read_parquet(IDENTITY_PARQUET)
-    else:
-        logging.info("Parquet files not found. Loading CSV and converting to Parquet...")
-        transactions = pd.read_csv(os.path.join(DATA_PATH, "train_transaction.csv"))
-        identity = pd.read_csv(os.path.join(DATA_PATH, "train_identity.csv"))
+    logging.info("Loading dataset...")
 
-        transactions.to_parquet(TRANSACTION_PARQUET, index=False)
-        identity.to_parquet(IDENTITY_PARQUET, index=False)
-        logging.info("Parquet conversion complete.")
+    transactions = pd.read_parquet(TRANSACTION_FILE)
+    identity = pd.read_parquet(IDENTITY_FILE)
 
     df = transactions.merge(identity, on="TransactionID", how="left")
-    logging.info(f"Dataset loaded successfully with {df.shape[0]} rows and {df.shape[1]} columns.")
-    
+    logging.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns.")
+
+    # Fix isFraud column
+    df["isFraud"] = df["isFraud"].astype(str).str.strip().astype(int)
+
+    # Convert TransactionDT to meaningful time features
+    df["TransactionDT_days"] = df["TransactionDT"] // (24 * 60 * 60)
+    df["TransactionDT_hours"] = df["TransactionDT"] // (60 * 60)
+
+    # Scale TransactionAMT
+    scaler = StandardScaler()
+    df["TransactionAmt_scaled"] = scaler.fit_transform(df[["TransactionAmt"]])
+
+    # Encode categorical features
+    categorical_cols = [
+        "ProductCD", "card1", "card2", "card3", "card4", "card5", "card6",
+        "addr1", "addr2", "P_emaildomain", "R_emaildomain",
+        "DeviceType", "DeviceInfo"
+    ] + [f"id_{i}" for i in range(12, 39)]  # id_12 to id_38
+
+    for col in categorical_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("Unknown")  # Fill missing values with "Unknown"
+            df[col] = df[col].astype(str)       # Convert all values to strings
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col])
+
+    logging.info("Data preprocessing complete.")
     return df
 
+
 def construct_graph(df: pd.DataFrame) -> nx.Graph:
-    """Builds a transaction graph, emphasizing fraud links.
+    """Builds a transaction graph where nodes represent transactions, and edges represent relationships.
 
     Args:
         df (pd.DataFrame): The transaction dataset.
@@ -77,33 +95,34 @@ def construct_graph(df: pd.DataFrame) -> nx.Graph:
     Returns:
         nx.Graph: A graph representing transaction relationships.
     """
-    G = nx.Graph()
     logging.info("Constructing transaction graph...")
+    G = nx.Graph()
 
-    # Add nodes with fraud labels
-    for _, row in tqdm(df[["TransactionID", "isFraud"]].itertuples(index=False), total=df.shape[0], desc="Adding nodes"):
-        G.add_node(row.TransactionID, fraud=row.isFraud)
+    # Add nodes (transactions)
+    for row in tqdm(df.itertuples(index=False), total=df.shape[0], desc="Adding nodes"):
+        G.add_node(row.TransactionID, isFraud=row.isFraud)
 
-    # Add edges based on shared features (e.g., card1 and addr1)
-    edge_count = 0
-    for _, row in tqdm(df[["card1", "addr1", "TransactionID"]].dropna().itertuples(index=False), total=df.shape[0], desc="Adding edges"):
-        G.add_edge(row.card1, row.addr1, weight=1)
-        edge_count += 1
+    # Add edges based on shared attributes
+    for col in ["card1", "addr1"]:
+        groups = df.groupby(col)["TransactionID"].apply(list)
+        for transactions in tqdm(groups, desc=f"Processing {col}"):
+            for i in range(len(transactions)):
+                for j in range(i + 1, len(transactions)):
+                    G.add_edge(transactions[i], transactions[j], weight=1)
 
-    logging.info(f"Graph construction complete: {G.number_of_nodes()} nodes, {edge_count} edges.")
+    # Add extra edges based on time and risk
+    for row in tqdm(df.itertuples(index=False), total=df.shape[0], desc="Adding extra edges"):
+        if row.D1 < 3:  # Transactions within 3 days
+            G.add_edge(row.TransactionID, f"time_{row.D1}", weight=1)
+        if row.C1 > 5:  # High-risk transactions
+            G.add_edge(row.TransactionID, f"count_{row.C1}", weight=2)
 
-    # Strengthen fraud connections
-    fraud_edges_updated = 0
-    for u, v in tqdm(G.edges(), desc="Updating fraud-based weights"):
-        if G.nodes[u]["fraud"] == 1 and G.nodes[v]["fraud"] == 1:
-            G[u][v]["weight"] += 2
-            fraud_edges_updated += 1
-
-    logging.info(f"Fraud-based weights updated for {fraud_edges_updated} edges.")
+    logging.info(f"Graph constructed: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
     return G
 
+
 def detect_communities(G: nx.Graph) -> dict:
-    """Detects fraud rings using Louvain community detection.
+    """Detects fraud rings using the Louvain method.
 
     Args:
         G (nx.Graph): The transaction graph.
@@ -111,38 +130,14 @@ def detect_communities(G: nx.Graph) -> dict:
     Returns:
         dict: Mapping of nodes to community labels.
     """
-    logging.info("Detecting communities using Louvain algorithm...")
-
+    logging.info("Detecting fraud communities using Louvain method...")
     partition = community.best_partition(G)
     nx.set_node_attributes(G, partition, "community")
 
     num_communities = len(set(partition.values()))
-    largest_community_size = max(partition.values(), key=list(partition.values()).count)
-
-    logging.info(f"Community detection complete. Found {num_communities} communities.")
-    logging.info(f"Largest community size: {largest_community_size} members.")
-
+    logging.info(f"Community detection complete: {num_communities} communities found.")
     return partition
 
-def visualize_fraud_rings(G: nx.Graph):
-    """Plots fraud rings using Plotly.
-
-    Args:
-        G (nx.Graph): The transaction graph.
-    """
-    logging.info("Visualizing fraud rings...")
-    pos = nx.spring_layout(G, seed=42)
-
-    node_x, node_y, node_color = [], [], []
-    for node, (x, y) in pos.items():
-        node_x.append(x)
-        node_y.append(y)
-        node_color.append("red" if G.nodes[node]["fraud"] == 1 else "blue")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=node_x, y=node_y, mode="markers", marker=dict(color=node_color, size=10)))
-    fig.show()
-    logging.info("Visualization completed.")
 
 def generate_embeddings(G: nx.Graph) -> dict:
     """Generates node embeddings using Node2Vec.
@@ -158,11 +153,12 @@ def generate_embeddings(G: nx.Graph) -> dict:
     model = node2vec.fit(window=10, min_count=1, batch_words=4)
 
     embeddings = {node: model.wv[node] for node in G.nodes()}
-    logging.info("Embeddings generated successfully.")
+    logging.info("Node2Vec embeddings generated successfully.")
     return embeddings
 
+
 def train_model(embeddings: dict, df: pd.DataFrame) -> RandomForestClassifier:
-    """Trains a fraud detection model using Random Forest.
+    """Trains a RandomForest model to classify fraudulent transactions.
 
     Args:
         embeddings (dict): Dictionary mapping node IDs to vector embeddings.
@@ -171,30 +167,29 @@ def train_model(embeddings: dict, df: pd.DataFrame) -> RandomForestClassifier:
     Returns:
         RandomForestClassifier: The trained model.
     """
-    logging.info("Preparing data for model training...")
-    
+    logging.info("Preparing data for training...")
     X, y = [], []
     valid_nodes = set(df["TransactionID"].values)
-    
+
     for node, embedding in embeddings.items():
         if node in valid_nodes:
             X.append(embedding)
             y.append(df.loc[df["TransactionID"] == node, "isFraud"].values[0])
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    logging.info(f"Training set: {len(X_train)} samples, Test set: {len(X_test)} samples")
+    logging.info(f"Training set size: {len(X_train)}, Test set size: {len(X_test)}")
 
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
-    
+
     logging.info(f"Model trained successfully! Accuracy: {acc:.4f}")
     logging.info("Classification Report:\n%s", classification_report(y_test, y_pred))
 
     return clf
+
 
 def save_model(model: RandomForestClassifier, path: str):
     """Saves the trained model using joblib.
@@ -204,18 +199,17 @@ def save_model(model: RandomForestClassifier, path: str):
         path (str): File path to save the model.
     """
     joblib.dump(model, path)
-    logging.info(f"Model saved successfully at {path}")
+    logging.info(f"Model saved at {path}")
+
 
 if __name__ == "__main__":
     logging.info("Starting fraud detection pipeline...")
 
-    df = load_data()
+    df = load_and_preprocess_data()
     G = construct_graph(df)
     detect_communities(G)
-    visualize_fraud_rings(G)
     embeddings = generate_embeddings(G)
     model = train_model(embeddings, df)
     save_model(model, MODEL_PATH)
 
     logging.info("Fraud detection pipeline completed successfully! 🚀")
-    logging.info(f"Model saved at {MODEL_PATH}")
